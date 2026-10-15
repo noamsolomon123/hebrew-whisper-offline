@@ -53,7 +53,7 @@ def safe_name(name):
 def unique_base(folder, stem):
     base = os.path.join(folder, stem)
     n = 2
-    while os.path.exists(base + ".txt") or os.path.exists(base + ".srt"):
+    while os.path.exists(base + ".txt") or os.path.exists(base + ".docx"):
         base = os.path.join(folder, "%s (%d)" % (stem, n))
         n += 1
     return base
@@ -118,7 +118,7 @@ def worker():
 def public(job):
     keys = ("id", "name", "size", "state", "progress", "error", "duration", "seconds", "device", "out")
     d = {k: job.get(k) for k in keys}
-    d["segments"] = job.get("segments", [])
+    d["text"] = engine.plain_text(job.get("segments", []))
     return d
 
 
@@ -151,17 +151,6 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 return self.send(200, {"model": status, "out_dir": OUT_DIR,
                                        "jobs": [public(jobs[i]) for i in order if i in jobs]})
-        if u.path == "/api/download":
-            job = jobs.get((q.get("id") or [""])[0])
-            fmt = (q.get("fmt") or ["txt"])[0]
-            if not job or job["state"] != "done" or fmt not in ("txt", "srt"):
-                return self.send(404, {"error": "not found"})
-            path = job["out"] + "." + fmt
-            with open(path, "rb") as f:
-                data = f.read()
-            fn = os.path.splitext(job["name"])[0] + "." + fmt
-            cd = "attachment; filename*=UTF-8''" + urllib.parse.quote(fn)
-            return self.send(200, data, "text/plain; charset=utf-8", {"Content-Disposition": cd})
         if u.path == "/api/open-folder":
             os.makedirs(OUT_DIR, exist_ok=True)
             os.startfile(OUT_DIR)
@@ -197,6 +186,22 @@ class Handler(BaseHTTPRequestHandler):
                 order.append(jid)
             todo.put(jid)
             return self.send(200, {"id": jid})
+        if u.path == "/api/save":
+            # The page sends the (possibly edited) text back; we return it as a file to save.
+            fmt = (q.get("fmt") or ["txt"])[0]
+            stem = os.path.splitext(safe_name((q.get("name") or ["transcript"])[0]))[0]
+            length = int(self.headers.get("Content-Length") or 0)
+            text = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            if fmt == "docx":
+                data = engine.docx_bytes(text, stem)
+                ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif fmt == "txt":
+                data = ("\ufeff" + text.replace("\r\n", "\n").replace("\n", "\r\n")).encode("utf-8")
+                ctype = "text/plain; charset=utf-8"
+            else:
+                return self.send(400, {"error": "fmt"})
+            cd = "attachment; filename*=UTF-8''" + urllib.parse.quote(stem + "." + fmt)
+            return self.send(200, data, ctype, {"Content-Disposition": cd})
         if u.path == "/api/remove":
             jid = (q.get("id") or [""])[0]
             with lock:

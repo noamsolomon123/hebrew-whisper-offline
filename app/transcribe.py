@@ -1,6 +1,6 @@
 # Hebrew Whisper (offline) - transcribe audio/video files to Hebrew text.
 #
-#   python transcribe.py <file-or-folder> [...]      -> writes <name>.txt and <name>.srt
+#   python transcribe.py <file-or-folder> [...]      -> writes <name>.txt and <name>.docx
 #   python transcribe.py --selftest                  -> checks the bundle, prints OK / FAIL
 #
 # Model: ivrit-ai/whisper-large-v3-ct2 (Whisper large-v3 fine-tuned for Hebrew), run by
@@ -104,21 +104,89 @@ def ts(sec, sep=","):
     return "%02d:%02d:%02d%s%03d" % (h, m, s, sep, ms)
 
 
+PARA_GAP_SEC = 1.6     # a pause this long starts a new paragraph
+PARA_MAX_CHARS = 700   # ...and so does a long run of speech, at the end of a sentence
+
+
+def paragraphs(segs):
+    out, cur, last_end = [], [], None
+    for a, z, t in segs:
+        t = t.strip()
+        if not t:
+            continue
+        size = sum(len(x) + 1 for x in cur)
+        if cur and ((a - last_end) >= PARA_GAP_SEC or
+                    (size >= PARA_MAX_CHARS and cur[-1][-1:] in ".?!")):
+            out.append(" ".join(cur))
+            cur = []
+        cur.append(t)
+        last_end = z
+    if cur:
+        out.append(" ".join(cur))
+    return out
+
+
+def plain_text(segs):
+    return "\n\n".join(paragraphs(segs))
+
+
+def _xml(s):
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "".join(c for c in s if c in "\t\n" or ord(c) >= 32)
+
+
+def docx_bytes(text, title=""):
+    # Minimal Word document, right-to-left Hebrew paragraphs. No python-docx needed.
+    import io
+    import zipfile
+    rpr = ('<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:rtl/>'
+           '<w:sz w:val="24"/><w:szCs w:val="24"/><w:lang w:bidi="he-IL"/></w:rPr>')
+    paras = []
+    if title:
+        paras.append('<w:p><w:pPr><w:bidi/><w:spacing w:after="240"/></w:pPr><w:r>'
+                     '<w:rPr><w:b/><w:bCs/><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:rtl/>'
+                     '<w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>'
+                     % _xml(title))
+    for p in text.replace("\r\n", "\n").split("\n"):
+        paras.append('<w:p><w:pPr><w:bidi/><w:spacing w:after="160" w:line="360" w:lineRule="auto"/></w:pPr>'
+                     '<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % (rpr, _xml(p)))
+    doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+           + "".join(paras) +
+           '<w:sectPr><w:bidi/><w:pgSz w:w="11906" w:h="16838"/>'
+           '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>')
+    types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>'
+             '<Override PartName="/word/document.xml" ContentType="application/'
+             'vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            'relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", doc)
+    return buf.getvalue()
+
+
 def write_outputs(path, segs):
     base = os.path.splitext(path)[0]
     targets = [base]
     fallback = os.path.join(os.path.expanduser("~"), "Documents", "Hebrew-Whisper-Output",
                             os.path.basename(base))
     targets.append(fallback)
+    text = plain_text(segs)
     for b in targets:
         try:
             os.makedirs(os.path.dirname(b), exist_ok=True)
             with open(b + ".txt", "w", encoding="utf-8-sig") as f:
-                for _, _, t in segs:
-                    f.write(t + "\n")
-            with open(b + ".srt", "w", encoding="utf-8-sig") as f:
-                for i, (a, z, t) in enumerate(segs, 1):
-                    f.write("%d\n%s --> %s\n%s\n\n" % (i, ts(a), ts(z), t))
+                f.write(text + "\n")
+            with open(b + ".docx", "wb") as f:
+                f.write(docx_bytes(text, os.path.basename(b)))
             return b
         except OSError:
             continue
@@ -154,7 +222,7 @@ def main(args):
             segs, dur = transcribe(f)
             b = write_outputs(f, segs)
             dt = time.time() - t0
-            print("  Done in %.0fs (%s, audio %.0fs) -> %s.txt / .srt" % (dt, state["device"], dur or 0, b))
+            print("  Done in %.0fs (%s, audio %.0fs) -> %s.txt / .docx" % (dt, state["device"], dur or 0, b))
         except Exception as e:
             failed += 1
             print("  FAILED: %s" % str(e).splitlines()[0][:300] if str(e) else "  FAILED: %r" % e)

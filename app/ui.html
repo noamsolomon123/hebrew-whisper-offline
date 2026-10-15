@@ -38,6 +38,7 @@
     border: 1px solid var(--line); border-radius: 8px; padding: 7px 14px; cursor: pointer;
     transition: background .15s, border-color .15s;
   }
+  button { white-space: nowrap; flex: none; }
   button:hover { background: #262b35; border-color: #39404d; }
   button.primary { background: var(--accent2); border-color: var(--accent2); }
   button.primary:hover { background: var(--accent); }
@@ -78,16 +79,18 @@
     display: flex; align-items: center; gap: 8px; padding: 12px 24px;
     border-bottom: 1px solid var(--line);
   }
-  .toolbar .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .toolbar .meta { color: var(--muted); font-size: 13px; }
+  .toolbar .title { min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .toolbar .meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
   label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
   #text {
-    flex: 1; overflow-y: auto; padding: 22px 28px 40px; font-size: 17px; line-height: 1.9;
-    white-space: pre-wrap; user-select: text;
+    flex: 1; width: 100%; resize: none; border: 0; outline: none; margin: 0;
+    background: var(--bg); color: var(--text); padding: 24px 32px 40px;
+    font: 17px/1.95 "Segoe UI", Arial, sans-serif; direction: rtl;
   }
-  #text .seg { display: block; padding: 1px 0; }
-  #text .t { color: var(--muted); font: 12px/1 Consolas, monospace; margin-left: 10px; direction: ltr; unicode-bidi: isolate; }
-  #text.hide-ts .t { display: none; }
+  #text[readonly] { color: #c9cdd6; }
+  #placeholder { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; padding: 6px 32px; border-top: 1px solid var(--line); }
+  .edited { color: var(--warn); font-size: 12px; }
   .empty { color: var(--muted); text-align: center; margin-top: 18vh; font-size: 15px; }
   .empty b { color: var(--text); font-weight: 600; display: block; font-size: 18px; margin-bottom: 6px; }
   .errbox { color: var(--err); padding: 22px 28px; }
@@ -127,12 +130,14 @@
       <span class="title" id="tTitle">—</span>
       <span class="meta" id="tMeta"></span>
       <span class="spacer"></span>
-      <label class="toggle"><input type="checkbox" id="ts"> זמנים</label>
+      <span class="edited" id="edited" hidden>נערך</span>
       <button id="copy" disabled>העתקה</button>
-      <button id="dlTxt" disabled>הורדת TXT</button>
-      <button id="dlSrt" class="primary" disabled>הורדת כתוביות SRT</button>
+      <button id="dlTxt" disabled>שמירה כ-TXT</button>
+      <button id="dlDocx" class="primary" disabled>שמירה כ-Word</button>
     </div>
-    <div id="text" class="hide-ts"><div class="empty"><b>אין עדיין תמלול</b>גררו קובץ לחלון כדי להתחיל. כל הקבצים נשמרים גם בתיקיית התוצאות.</div></div>
+    <div id="placeholder"><div class="empty"><b>אין עדיין תמלול</b>גררו קובץ לחלון כדי להתחיל. כל תמלול נשמר גם בתיקיית התוצאות (TXT + Word).</div></div>
+    <textarea id="text" spellcheck="false" hidden></textarea>
+    <div class="hint" id="hint" hidden>אפשר לתקן מילים ישירות בטקסט. העתקה ושמירה לוקחות את הגרסה המתוקנת.</div>
   </section>
 </main>
 <div id="toast"></div>
@@ -140,6 +145,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let jobs = [], sel = null, model = {}, lastRendered = "", fails = 0;
+const edits = {};  // job id -> text the user changed
 const uploads = {};  // temp id -> {name, size, pct}
 
 function fmtTime(s) {
@@ -173,31 +179,38 @@ function renderList() {
   }).join("");
 }
 
+function showText(on) {
+  $("#placeholder").hidden = on; $("#text").hidden = !on; $("#hint").hidden = !on;
+}
+function placeholder(title, body, err) {
+  showText(false);
+  $("#placeholder").innerHTML = err ? `<div class="errbox">${esc(title)}</div>`
+    : `<div class="empty"><b>${esc(title)}</b>${esc(body)}</div>`;
+}
+function currentText(j) { return j.id in edits ? edits[j.id] : j.text; }
+
 function renderText() {
   const j = jobs.find(x => x.id === sel);
   const can = j && j.state === "done";
-  for (const b of ["#copy", "#dlTxt", "#dlSrt"]) $(b).disabled = !can;
+  for (const b of ["#copy", "#dlTxt", "#dlDocx"]) $(b).disabled = !can;
+  $("#edited").hidden = !(j && j.id in edits);
   if (!j) {
     $("#tTitle").textContent = "—"; $("#tMeta").textContent = "";
-    if (lastRendered !== "empty") {
-      $("#text").innerHTML = '<div class="empty"><b>אין עדיין תמלול</b>גררו קובץ לחלון כדי להתחיל. כל הקבצים נשמרים גם בתיקיית התוצאות.</div>';
-      lastRendered = "empty";
-    }
+    if (lastRendered !== "empty") { placeholder("אין עדיין תמלול", "גררו קובץ לחלון כדי להתחיל. כל תמלול נשמר גם בתיקיית התוצאות (TXT + Word)."); lastRendered = "empty"; }
     return;
   }
   $("#tTitle").textContent = j.name;
   $("#tMeta").textContent = stateText(j);
-  const key = j.id + ":" + j.state + ":" + j.segments.length;
+  const key = j.id + ":" + j.state + ":" + j.text.length;
   if (key === lastRendered) return;
   lastRendered = key;
+  if (j.state === "error") return placeholder(j.error || "שגיאה", "", true);
+  if (!j.text) return placeholder(j.state === "queued" ? "ממתין בתור…" : "מתמלל…", "הטקסט יופיע כאן תוך כדי.");
   const box = $("#text");
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  if (j.state === "error") { box.innerHTML = `<div class="errbox">${esc(j.error || "שגיאה")}</div>`; return; }
-  if (!j.segments.length) {
-    box.innerHTML = `<div class="empty"><b>${j.state === "queued" ? "ממתין בתור…" : "מתמלל…"}</b>הטקסט יופיע כאן תוך כדי.</div>`;
-    return;
-  }
-  box.innerHTML = j.segments.map(s => `<span class="seg"><span class="t">${fmtTime(s[0])}</span>${esc(s[2])}</span>`).join("");
+  const atBottom = box.hidden || box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  showText(true);
+  box.readOnly = j.state !== "done";
+  if (document.activeElement !== box || box.readOnly) box.value = currentText(j);
   if (j.state === "running" && atBottom) box.scrollTop = box.scrollHeight;
 }
 
@@ -259,16 +272,31 @@ $("#list").onclick = async e => {
   const j = e.target.closest(".job");
   if (j && !j.dataset.id.startsWith("u")) { sel = j.dataset.id; lastRendered = ""; renderList(); renderText(); }
 };
-$("#ts").onchange = e => $("#text").classList.toggle("hide-ts", !e.target.checked);
+$("#text").oninput = e => {
+  const j = jobs.find(x => x.id === sel); if (!j || j.state !== "done") return;
+  if (e.target.value === j.text) delete edits[j.id]; else edits[j.id] = e.target.value;
+  $("#edited").hidden = !(j.id in edits);
+};
 $("#copy").onclick = async () => {
   const j = jobs.find(x => x.id === sel); if (!j) return;
-  const txt = j.segments.map(s => ($("#ts").checked ? "[" + fmtTime(s[0]) + "] " : "") + s[2]).join("\n");
+  const txt = currentText(j);
   try { await navigator.clipboard.writeText(txt); }
-  catch (e) { const t = document.createElement("textarea"); t.value = txt; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  catch (e) { const t = $("#text"); t.focus(); t.select(); document.execCommand("copy"); }
   toast("הטקסט הועתק");
 };
-$("#dlTxt").onclick = () => { location.href = "/api/download?fmt=txt&id=" + sel; };
-$("#dlSrt").onclick = () => { location.href = "/api/download?fmt=srt&id=" + sel; };
+async function save(fmt) {
+  const j = jobs.find(x => x.id === sel); if (!j) return;
+  const r = await fetch("/api/save?fmt=" + fmt + "&name=" + encodeURIComponent(j.name), {
+    method: "POST", body: new Blob([currentText(j)], { type: "text/plain;charset=utf-8" }) });
+  if (!r.ok) return toast("השמירה נכשלה");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = j.name.replace(/\.[^.]+$/, "") + "." + fmt;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+$("#dlTxt").onclick = () => save("txt");
+$("#dlDocx").onclick = () => save("docx");
 $("#openFolder").onclick = () => fetch("/api/open-folder");
 
 poll(); setInterval(poll, 1000);
