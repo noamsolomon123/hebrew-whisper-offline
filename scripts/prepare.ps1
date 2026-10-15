@@ -125,11 +125,22 @@ Write-Host ('  bundle size {0:N1} GB' -f ($size / 1GB))
 
 # ---- 6. encode to text ----------------------------------------------------------------
 if ($SkipEncode) { Write-Host ''; Write-Host "DONE (not encoded): $bundle"; exit 0 }
+# One zip, so the stick carries ~11 .txt files instead of one per Python file (3000+).
+Step 'Zip the bundle'
+$zipDir = Join-Path $OutRoot 'zip'
+New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+$zipPath = Join-Path $zipDir 'HebrewWhisper.zip'
+if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory($bundle, $zipPath, [System.IO.Compression.CompressionLevel]::Fastest, $true)
+Write-Host ('  zip {0:N1} GB' -f ((Get-Item -LiteralPath $zipPath).Length / 1GB))
+
 Step "Encode to text ($ChunkMB MB per .txt)"
 $ErrorActionPreference = 'Continue'
 $textDir = Join-Path $OutRoot 'HebrewWhisper-text'
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'tools\text-transfer\scripts\TextTransfer-Encode.ps1') -Source $bundle -OutDir $textDir -ChunkMB $ChunkMB
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'tools\text-transfer\scripts\TextTransfer-Encode.ps1') -Source $zipPath -OutDir $textDir -ChunkMB $ChunkMB
 if ($LASTEXITCODE -ne 0) { Fail 'encode' }
+Copy-Item -LiteralPath (Join-Path $repo 'app\START-HERE-HE.txt') -Destination $textDir -Force
 
 Write-Host ''
 Write-Host 'DONE. Copy EVERY file in this folder to the stick:'

@@ -1,0 +1,8 @@
+﻿תמלול עברית אופליין - התקנה
+
+1. לשים את כל קבצי ה-txt + DECODE.bat + TextTransfer-Decode.ps1 באותה תיקייה.
+2. לחיצה כפולה על DECODE.bat. ייווצר decoded\HebrewWhisper.zip
+3. קליק ימני על HebrewWhisper.zip > Extract All (חילוץ הכל) אל C:\ (נתיב קצר).
+   התוצאה: C:\HebrewWhisper
+4. לחיצה כפולה על C:\HebrewWhisper\SELFTEST.bat. צריך RESULT: OK (GPU). לצלם ולשלוח.
+5. לתמלל: לגרור קובץ שמע/וידאו או תיקייה על TRANSCRIBE.bat. הוראות נוספות: HOW-TO-HE.txt
