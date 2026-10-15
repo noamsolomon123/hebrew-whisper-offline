@@ -5,6 +5,6 @@ Hebrew speech-to-text for the offline A5000 PC. Model: `ivrit-ai/whisper-large-v
 CPU int8 fallback. Fully self-contained: embeddable Python 3.12 + CUDA 12 libs (pip wheels) + model.
 
 - blackberry: `git pull`, double-click `PREPARE-ON-BLACKBERRY.bat` (~5 GB download, ~15 GB free disk)
-  -> copy all of `build\HebrewWhisper-text\` to the stick.
-- Offline PC: all .txt + `DECODE.bat` in one folder -> `DECODE.bat` -> `decoded\HebrewWhisper\SELFTEST.bat`
+  -> copy all of `build\HebrewWhisper-text\` (~5.5 GB, 13 .txt) to the stick.
+- Offline PC (START-HERE-HE.txt): `DECODE.bat` (~25 min) -> extract `decoded\HebrewWhisper.zip` to `C:\` -> `C:\HebrewWhisper\SELFTEST.bat`
   -> drag audio/video onto `TRANSCRIBE.bat` -> `<name>.txt` + `<name>.srt` next to it.
