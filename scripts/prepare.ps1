@@ -1,0 +1,137 @@
+# Builds the offline Hebrew Whisper bundle and encodes it to text.
+# Runs on blackberry (needs internet). Windows PowerShell 5.1. ASCII only.
+#
+#   build\HebrewWhisper\          the ready-to-run folder (python + libs + model + app)
+#   build\HebrewWhisper-text\     the numbered .txt files + DECODE.bat to carry across
+
+param(
+  [string]$OutRoot = '',
+  [int]$ChunkMB = 500,
+  [switch]$SkipEncode
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$repo = Split-Path -Parent $PSScriptRoot
+if (-not $OutRoot) { $OutRoot = Join-Path $repo 'build' }
+
+$PY_VER = '3.12.10'
+$PY_URL = "https://www.python.org/ftp/python/$PY_VER/python-$PY_VER-embed-amd64.zip"
+$GETPIP = 'https://bootstrap.pypa.io/get-pip.py'
+$MODEL_REPO = 'ivrit-ai/whisper-large-v3-ct2'
+$MODEL_REV = 'e9ed4a4a98d761b0f617d668303de2c514236c66'
+$MODEL_FILES = @('config.json', 'model.bin', 'preprocessor_config.json', 'tokenizer.json', 'vocabulary.json')
+$MODEL_BIN_SHA = '765965efd777190f76e8b337520056f00d68e48bb99b2f95d28670b2364a02ce'
+$PIP_PKGS = @('faster-whisper==1.2.1', 'ctranslate2==4.7.1', 'av==16.1.0', 'nvidia-cublas-cu12==12.9.2.10', 'nvidia-cudnn-cu12==9.27.0.42')
+
+$curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+
+function Step($m) { Write-Host ''; Write-Host "== $m" }
+function Fail($m) { Write-Host ''; Write-Host "FAILED: $m"; exit 1 }
+
+function Sha256File($p) {
+  $s = [System.Security.Cryptography.SHA256]::Create()
+  $f = [System.IO.File]::OpenRead($p)
+  try { return ([BitConverter]::ToString($s.ComputeHash($f)) -replace '-', '').ToLower() }
+  finally { $f.Dispose(); $s.Dispose() }
+}
+
+function Download($url, $dest) {
+  $ErrorActionPreference = 'Continue'
+  & $curl -L --fail --retry 5 --retry-delay 3 -C - -o $dest $url
+  if ($LASTEXITCODE -ne 0) { Fail "download $url (curl exit $LASTEXITCODE)" }
+}
+
+if (-not (Test-Path -LiteralPath $curl)) { Fail 'curl.exe not found in System32 (needs Windows 10 1803+).' }
+
+$bundle = Join-Path $OutRoot 'HebrewWhisper'
+$cache = Join-Path $OutRoot 'cache'
+New-Item -ItemType Directory -Force -Path $bundle, $cache | Out-Null
+
+# ---- 1. Python (embeddable) -----------------------------------------------------------
+Step "Python $PY_VER (embeddable)"
+$pyDir = Join-Path $bundle 'python'
+$pyExe = Join-Path $pyDir 'python.exe'
+if (-not (Test-Path -LiteralPath $pyExe)) {
+  $zip = Join-Path $cache "python-$PY_VER-embed-amd64.zip"
+  if (-not (Test-Path -LiteralPath $zip)) { Download $PY_URL $zip }
+  Expand-Archive -LiteralPath $zip -DestinationPath $pyDir -Force
+  $pth = Get-ChildItem -LiteralPath $pyDir -Filter 'python3*._pth' | Select-Object -First 1
+  $lines = Get-Content -LiteralPath $pth.FullName | ForEach-Object { if ($_ -eq '#import site') { 'import site' } else { $_ } }
+  $lines = @($lines) + @('Lib\site-packages')
+  [System.IO.File]::WriteAllLines($pth.FullName, $lines)
+}
+
+# ---- 2. pip + packages ----------------------------------------------------------------
+Step 'pip + faster-whisper + CUDA 12 libs (about 1.5 GB)'
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+# native tools write warnings to stderr; under 'Stop' PS 5.1 would turn those into errors
+$ErrorActionPreference = 'Continue'
+if (-not (Test-Path -LiteralPath (Join-Path $pyDir 'Lib\site-packages\pip'))) {
+  $gp = Join-Path $cache 'get-pip.py'
+  Download $GETPIP $gp
+  & $pyExe $gp --no-warn-script-location
+  if ($LASTEXITCODE -ne 0) { Fail 'get-pip.py' }
+}
+& $pyExe -m pip install --no-warn-script-location --only-binary=:all: @PIP_PKGS
+if ($LASTEXITCODE -ne 0) { Fail 'pip install' }
+& $pyExe -c 'import faster_whisper, ctranslate2, av; print(faster_whisper.__version__, ctranslate2.__version__, av.__version__)'
+if ($LASTEXITCODE -ne 0) { Fail 'import test' }
+# pip is not needed on the far side; drop its caches to keep the bundle small
+Get-ChildItem -LiteralPath $pyDir -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
+$ErrorActionPreference = 'Stop'
+
+# ---- 3. model -------------------------------------------------------------------------
+Step "Model $MODEL_REPO (about 3.1 GB)"
+$modelDir = Join-Path $bundle 'model'
+New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+foreach ($name in $MODEL_FILES) {
+  $dest = Join-Path $modelDir $name
+  if ($name -eq 'model.bin' -and (Test-Path -LiteralPath $dest) -and ((Sha256File $dest) -eq $MODEL_BIN_SHA)) { continue }
+  Download "https://huggingface.co/$MODEL_REPO/resolve/$MODEL_REV/$name" $dest
+}
+Write-Host '  verifying model.bin SHA-256...'
+if ((Sha256File (Join-Path $modelDir 'model.bin')) -ne $MODEL_BIN_SHA) {
+  Remove-Item -LiteralPath (Join-Path $modelDir 'model.bin') -Force
+  Fail 'model.bin hash mismatch (deleted; run again)'
+}
+
+# ---- 4. app ---------------------------------------------------------------------------
+Step 'App files'
+$appDir = Join-Path $bundle 'app'
+New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo 'app\transcribe.py') -Destination $appDir -Force
+Copy-Item -LiteralPath (Join-Path $repo 'tests\sample-he.mp3') -Destination $appDir -Force
+foreach ($n in @('TRANSCRIBE.bat', 'SELFTEST.bat', 'HOW-TO-HE.txt')) {
+  Copy-Item -LiteralPath (Join-Path $repo "app\$n") -Destination $bundle -Force
+}
+
+# ---- 5. manifest ----------------------------------------------------------------------
+Step 'manifest.sha256'
+$man = Join-Path $bundle 'manifest.sha256'
+if (Test-Path -LiteralPath $man) { Remove-Item -LiteralPath $man -Force }
+$root = (Get-Item -LiteralPath $bundle).FullName.TrimEnd('\') + '\'
+$sb = New-Object System.Text.StringBuilder
+Get-ChildItem -LiteralPath $bundle -Recurse -File | Sort-Object FullName | ForEach-Object {
+  $rel = $_.FullName.Substring($root.Length)
+  [void]$sb.Append((Sha256File $_.FullName) + '  ' + $rel + [char]10)
+}
+[System.IO.File]::WriteAllText($man, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+$size = (Get-ChildItem -LiteralPath $bundle -Recurse -File | Measure-Object Length -Sum).Sum
+Write-Host ('  bundle size {0:N1} GB' -f ($size / 1GB))
+
+# ---- 6. encode to text ----------------------------------------------------------------
+if ($SkipEncode) { Write-Host ''; Write-Host "DONE (not encoded): $bundle"; exit 0 }
+Step "Encode to text ($ChunkMB MB per .txt)"
+$ErrorActionPreference = 'Continue'
+$textDir = Join-Path $OutRoot 'HebrewWhisper-text'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'tools\text-transfer\scripts\TextTransfer-Encode.ps1') -Source $bundle -OutDir $textDir -ChunkMB $ChunkMB
+if ($LASTEXITCODE -ne 0) { Fail 'encode' }
+
+Write-Host ''
+Write-Host 'DONE. Copy EVERY file in this folder to the stick:'
+Write-Host "  $textDir"
+exit 0
