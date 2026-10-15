@@ -136,20 +136,38 @@ def _xml(s):
 
 
 def docx_bytes(text, title=""):
-    # Minimal Word document, right-to-left Hebrew paragraphs. No python-docx needed.
+    blocks = [("title", title)] if title else []
+    blocks += [("p", p) for p in text.replace("\r\n", "\n").split("\n")]
+    return docx_from_blocks(blocks)
+
+
+_STYLE = {  # kind -> (size in half-points, bold, space after, colour, indent, prefix)
+    "title": (34, True, 200, "1F3A68", 0, ""),
+    "h": (27, True, 100, "2F5597", 0, ""),
+    "h2": (24, True, 60, "404040", 0, ""),
+    "p": (24, False, 160, None, 0, ""),
+    "li": (24, False, 60, None, 360, "•  "),
+    "task": (24, False, 60, None, 360, "☐  "),
+}
+
+
+def docx_from_blocks(blocks):
+    # Minimal Word document, right-to-left Hebrew. No python-docx needed.
     import io
     import zipfile
-    rpr = ('<w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:rtl/>'
-           '<w:sz w:val="24"/><w:szCs w:val="24"/><w:lang w:bidi="he-IL"/></w:rPr>')
     paras = []
-    if title:
-        paras.append('<w:p><w:pPr><w:bidi/><w:spacing w:after="240"/></w:pPr><w:r>'
-                     '<w:rPr><w:b/><w:bCs/><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:rtl/>'
-                     '<w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>'
-                     % _xml(title))
-    for p in text.replace("\r\n", "\n").split("\n"):
-        paras.append('<w:p><w:pPr><w:bidi/><w:spacing w:after="160" w:line="360" w:lineRule="auto"/></w:pPr>'
-                     '<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % (rpr, _xml(p)))
+    for kind, text in blocks:
+        size, bold, after, color, ind, prefix = _STYLE.get(kind, _STYLE["p"])
+        before = 280 if kind == "h" else 0
+        rpr = ('<w:rPr>%s<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>%s<w:rtl/>'
+               '<w:sz w:val="%d"/><w:szCs w:val="%d"/><w:lang w:bidi="he-IL"/></w:rPr>'
+               % ("<w:b/><w:bCs/>" if bold else "", '<w:color w:val="%s"/>' % color if color else "",
+                  size, size))
+        ppr = ('<w:pPr><w:bidi/><w:spacing w:before="%d" w:after="%d" w:line="%d" w:lineRule="auto"/>%s</w:pPr>'
+               % (before, after, 300 if kind in ("li", "task") else 360,
+                  '<w:ind w:start="%d"/>' % ind if ind else ""))
+        paras.append('<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>'
+                     % (ppr, rpr, _xml(prefix + text)))
     doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
            + "".join(paras) +

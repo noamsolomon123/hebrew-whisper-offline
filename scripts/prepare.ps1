@@ -103,7 +103,7 @@ if ((Sha256File (Join-Path $modelDir 'model.bin')) -ne $MODEL_BIN_SHA) {
 Step 'App files'
 $appDir = Join-Path $bundle 'app'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-foreach ($n in @('transcribe.py', 'server.py', 'ui.html')) {
+foreach ($n in @('transcribe.py', 'server.py', 'ai.py', 'window.py', 'ui.html', 'icon.ico')) {
   Copy-Item -LiteralPath (Join-Path $repo "app\$n") -Destination $appDir -Force
 }
 Copy-Item -LiteralPath (Join-Path $repo 'tests\sample-he.mp3') -Destination $appDir -Force
