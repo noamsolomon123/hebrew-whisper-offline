@@ -13,6 +13,7 @@
     --ok: #3fb97a; --err: #e5534b; --warn: #d8a43a;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; }
   body {
     background: var(--bg); color: var(--text);
@@ -145,6 +146,19 @@
   .topic + .topic { margin-top: 14px; padding-top: 14px; border-top: 1px solid #232832; }
   .topic h4 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; }
 
+  /* ---- recorder ---- */
+  #rec { margin: -4px 16px 14px; }
+  #recBtn { width: 100%; display: flex; align-items: center; justify-content: center; gap: 9px; }
+  .rdot { width: 10px; height: 10px; border-radius: 50%; background: #e5534b; flex: none; }
+  .rdot.on { animation: pulse 1.1s ease-in-out infinite; }
+  #recLive { border: 1px solid rgba(229,83,75,.4); background: rgba(229,83,75,.06); border-radius: 12px; padding: 12px; }
+  .rrow { display: flex; align-items: center; gap: 8px; }
+  .rrow + .rrow { margin-top: 10px; }
+  .rrow button { flex: 1; padding: 6px 8px; font-size: 13.5px; }
+  #recTime { font: 600 18px Consolas, monospace; direction: ltr; min-width: 64px; }
+  .meter { flex: 1; height: 6px; background: #2a2f39; border-radius: 6px; overflow: hidden; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .08s; }
+  #recLive.paused .rdot { animation: none; opacity: .4; }
   /* ---- project bar, history, dialog ---- */
   .proj { padding: 14px 16px 0; }
   .proj .pname { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -218,6 +232,14 @@
       <div class="big">גררו לכאן קבצי שמע או וידאו</div>
       <div class="small">או לחצו לבחירה · mp3, wav, m4a, mp4, mov, mkv…</div>
       <input id="pick" type="file" multiple hidden accept="audio/*,video/*,.mxf,.mts,.amr,.opus">
+    </div>
+    <div id="rec">
+      <button id="recBtn"><span class="rdot"></span>הקלטה מהמיקרופון</button>
+      <div id="recLive" hidden>
+        <div class="rrow"><span class="rdot on"></span><span id="recTime">0:00</span>
+          <div class="meter"><i id="recLevel"></i></div></div>
+        <div class="rrow"><button id="recStop" class="primary">עצירה ותמלול</button><button id="recPause">השהיה</button><button id="recCancel">ביטול</button></div>
+      </div>
     </div>
     <div id="list"></div>
     <div class="foot"><button id="openFolder">פתיחת תיקיית התוצאות</button></div>
@@ -422,12 +444,12 @@ async function poll() {
   }
 }
 
-function upload(file) {
+function upload(file, keep) {
   const tmp = "u" + Math.random().toString(36).slice(2);
   uploads[tmp] = { id: tmp, name: file.name, size: file.size, pct: 0, uploading: true };
   renderList();
   const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
+  xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name) + (keep ? "&keep=1" : ""));
   xhr.upload.onprogress = e => { if (e.lengthComputable) { uploads[tmp].pct = 100 * e.loaded / e.total; renderList(); } };
   xhr.onload = () => {
     delete uploads[tmp];
@@ -568,7 +590,68 @@ $("#histList").onclick = e => {
   guard(() => switchTo("/api/project/open?id=" + row.dataset.p));
 };
 for (const o of document.querySelectorAll(".overlay")) o.addEventListener("mousedown", e => { if (e.target === o) o.classList.remove("on"); });
-window.addEventListener("beforeunload", e => { if (unsaved()) { e.preventDefault(); e.returnValue = ""; } });
+window.addEventListener("beforeunload", e => { if (unsaved() || rec.mr) { e.preventDefault(); e.returnValue = ""; } });
+
+/* ---- recorder: microphone -> webm/opus -> same upload path as a dropped file ---- */
+const rec = { mr: null, chunks: [], stream: null, t0: 0, acc: 0, timer: null, ctx: null, raf: 0 };
+function recUi(on) { $("#recBtn").hidden = on; $("#recLive").hidden = !on; $("#recLive").classList.remove("paused"); $("#recPause").textContent = "השהיה"; }
+function recElapsed() { return rec.acc + (rec.mr && rec.mr.state === "recording" ? Date.now() - rec.t0 : 0); }
+function recStopAll() {
+  clearInterval(rec.timer); cancelAnimationFrame(rec.raf);
+  if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
+  if (rec.ctx) rec.ctx.close();
+  rec.mr = rec.stream = rec.ctx = null; recUi(false);
+}
+$("#recBtn").onclick = async () => {
+  try {
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    return ask("אין גישה למיקרופון", e.name === "NotFoundError" ? "לא נמצא מיקרופון מחובר למחשב." : "צריך לאשר גישה למיקרופון (בחלון שקפץ, או בסמל המנעול/המצלמה בשורת הכתובת).", [{ label: "הבנתי" }]);
+  }
+  const type = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"].find(t => MediaRecorder.isTypeSupported(t)) || "";
+  rec.mr = new MediaRecorder(rec.stream, type ? { mimeType: type, audioBitsPerSecond: 64000 } : undefined);
+  rec.chunks = []; rec.acc = 0; rec.t0 = Date.now();
+  rec.mr.ondataavailable = e => { if (e.data.size) rec.chunks.push(e.data); };
+  rec.mr.start(1000);
+  recUi(true);
+  rec.timer = setInterval(() => { $("#recTime").textContent = fmtTime(recElapsed() / 1000); }, 250);
+  rec.ctx = new AudioContext();
+  const an = rec.ctx.createAnalyser(); an.fftSize = 512;
+  rec.ctx.createMediaStreamSource(rec.stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  const tick = () => {
+    an.getByteTimeDomainData(buf);
+    let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $("#recLevel").style.width = Math.min(100, peak / 128 * 160) + "%";
+    rec.raf = requestAnimationFrame(tick);
+  };
+  tick();
+};
+$("#recPause").onclick = () => {
+  if (!rec.mr) return;
+  if (rec.mr.state === "recording") { rec.mr.pause(); rec.acc += Date.now() - rec.t0; $("#recPause").textContent = "המשך"; $("#recLive").classList.add("paused"); }
+  else { rec.mr.resume(); rec.t0 = Date.now(); $("#recPause").textContent = "השהיה"; $("#recLive").classList.remove("paused"); }
+};
+$("#recCancel").onclick = () => {
+  if (!rec.mr) return;
+  ask("לבטל את ההקלטה?", "ההקלטה תימחק ולא תתומלל.", [
+    { label: "מחיקה", cls: "primary", fn: () => { rec.mr.onstop = null; rec.mr.stop(); recStopAll(); } },
+    { label: "המשך הקלטה" }]);
+};
+$("#recStop").onclick = () => {
+  if (!rec.mr) return;
+  const mr = rec.mr;
+  mr.onstop = () => {
+    const blob = new Blob(rec.chunks, { type: mr.mimeType || "audio/webm" });
+    recStopAll();
+    const d = new Date(), p = n => String(n).padStart(2, "0");
+    const ext = (mr.mimeType || "").includes("ogg") ? "ogg" : "webm";
+    const name = `הקלטה ${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}-${p(d.getMinutes())}.${ext}`;
+    if (blob.size < 2000) return toast("ההקלטה ריקה");
+    upload(new File([blob], name, { type: blob.type }), true);
+  };
+  mr.stop();
+};
 async function copyText(txt) {
   try { await navigator.clipboard.writeText(txt); }
   catch (e) { const t = document.createElement("textarea"); t.value = txt; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }

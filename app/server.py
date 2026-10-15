@@ -166,7 +166,16 @@ def worker():
             log("FAILED %s\n%s" % (job["name"], traceback.format_exc()))
         finally:
             try:
-                os.remove(job["path"])
+                if job.get("keep"):   # a recording made in the app: the audio is the original, keep it
+                    rec_dir = os.path.join(OUT_DIR, "הקלטות")
+                    os.makedirs(rec_dir, exist_ok=True)
+                    dest = os.path.join(rec_dir, job["name"])
+                    if os.path.exists(dest):
+                        dest = os.path.join(rec_dir, job["id"] + "_" + job["name"])
+                    os.replace(job["path"], dest)
+                    job["audio"] = dest
+                else:
+                    os.remove(job["path"])
             except OSError:
                 pass
 
@@ -275,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "upload cut"})
             with lock:
                 jobs[jid] = {"id": jid, "name": name, "size": length, "path": path, "created": time.time(),
+                             "keep": (q.get("keep") or ["0"])[0] == "1",
                              "state": "queued", "progress": 0.0, "segments": []}
                 order.append(jid)
                 touch()
