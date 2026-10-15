@@ -10,7 +10,7 @@ import uuid
 DIR = os.path.join(os.path.expanduser("~"), "Documents", "Hebrew-Whisper-Output", "_projects")
 
 KEEP = ("id", "name", "size", "state", "error", "duration", "seconds", "device", "out",
-        "segments", "edited", "ai", "ai_state", "ai_error", "done_tasks", "created")
+        "segments", "edited", "ai", "ai_state", "ai_error", "done_tasks", "created", "audio")
 
 
 def _path(pid):

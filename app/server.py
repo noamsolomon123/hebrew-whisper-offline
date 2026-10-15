@@ -5,6 +5,7 @@
 # on 127.0.0.1. It exits by itself a minute after the last browser tab is closed.
 
 import json
+import mimetypes
 import os
 import queue
 import sys
@@ -13,14 +14,19 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 # The embeddable Python's ._pth file means the script folder is not on sys.path by itself.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import appbase  # noqa: E402
+
+try:
+    OUT_DIR = appbase.out_dir()
+except OSError as _e:
+    appbase.message_box("Hebrew Whisper: no folder to save into.\n%s" % _e)
+    raise SystemExit(1)
 if sys.stdout is None:  # pythonw: no console, keep a log next to the outputs instead
-    _log_dir = os.path.join(os.path.expanduser("~"), "Documents", "Hebrew-Whisper-Output")
-    os.makedirs(_log_dir, exist_ok=True)
-    sys.stdout = sys.stderr = open(os.path.join(_log_dir, "_log.txt"), "a", encoding="utf-8")
+    sys.stdout = sys.stderr = open(os.path.join(OUT_DIR, "_log.txt"), "a", encoding="utf-8")
 
 import ai  # noqa: E402
 import projects  # noqa: E402
@@ -28,9 +34,13 @@ import window  # noqa: E402
 import transcribe as engine  # noqa: E402
 
 PORT = int(os.environ.get("HW_PORT", "8765"))
-OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "Hebrew-Whisper-Output")
+projects.DIR = os.path.join(OUT_DIR, "_projects")
+AUTOSAVE = os.path.join(OUT_DIR, "_autosave.json")   # crash insurance for unsaved work
 WORK_DIR = os.path.join(OUT_DIR, "_incoming")
+AUDIO_DIR = os.path.join(OUT_DIR, "_audio")   # every job's audio, kept for the player
 UI = os.path.join(engine.HERE, "ui.html")
+STATIC = {"/ui.css": ("ui.css", "text/css; charset=utf-8"),
+          "/ui.js": ("ui.js", "application/javascript; charset=utf-8")}
 IDLE_EXIT_SEC = 90          # app window: its poll keeps running even when minimized
 IDLE_EXIT_BROWSER_SEC = 900  # plain browser tab: background tabs poll rarely
 win = {"closed": False, "app": False}
@@ -41,11 +51,35 @@ todo = queue.Queue()
 lock = threading.Lock()
 status = {"model": "loading", "device": None, "error": None}
 last_ping = [time.time()]
-project = {"id": None, "name": "", "dirty": False}   # the work in the window; unsaved until Save
+project = {"id": None, "name": "", "dirty": False, "restored": False}  # unsaved until Save
+autosave_due = [False]
 
 
 def touch():
     project["dirty"] = True
+    autosave_due[0] = True
+
+
+def autosave_now():
+    # Unsaved work is mirrored to disk, so a crash, sleep or closed window loses nothing.
+    autosave_due[0] = False
+    try:
+        if project["dirty"] and jobs:
+            with lock:
+                snap = [projects.snapshot(jobs[i]) for i in order if i in jobs]
+            appbase.write_json_atomic(AUTOSAVE, {"project": {k: project[k] for k in ("id", "name")},
+                                                 "jobs": snap})
+        elif os.path.exists(AUTOSAVE):
+            os.remove(AUTOSAVE)
+    except OSError as e:
+        log("autosave failed: %s" % e)
+
+
+def autosave_loop():
+    while True:
+        time.sleep(3)
+        if autosave_due[0]:
+            autosave_now()
 
 
 def log(msg):
@@ -165,19 +199,56 @@ def worker():
             job.update(state="error", error=msg)
             log("FAILED %s\n%s" % (job["name"], traceback.format_exc()))
         finally:
-            try:
-                if job.get("keep"):   # a recording made in the app: the audio is the original, keep it
-                    rec_dir = os.path.join(OUT_DIR, "הקלטות")
-                    os.makedirs(rec_dir, exist_ok=True)
-                    dest = os.path.join(rec_dir, job["name"])
-                    if os.path.exists(dest):
-                        dest = os.path.join(rec_dir, job["id"] + "_" + job["name"])
-                    os.replace(job["path"], dest)
-                    job["audio"] = dest
-                else:
-                    os.remove(job["path"])
-            except OSError:
-                pass
+            stash_audio(job)
+
+
+def stash_audio(job):
+    """Moves the upload out of _incoming so the page can play it next to the text.
+    A recording made in the app is the only copy of it: that one goes to Output/הקלטות."""
+    src = job.get("path")
+    if not src or not os.path.isfile(src) or os.path.dirname(src) != WORK_DIR:
+        return
+    try:
+        folder = os.path.join(OUT_DIR, "הקלטות") if job.get("keep") else AUDIO_DIR
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, job["name"] if job.get("keep") else job["id"] + "_" + job["name"])
+        if os.path.exists(dest):
+            dest = os.path.join(folder, job["id"] + "_" + job["name"])
+        os.replace(src, dest)
+        job["audio"] = job["path"] = dest
+    except OSError:
+        pass
+
+
+def audio_of(job):
+    for k in ("audio", "path"):
+        p = job.get(k)
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def mmss(sec):
+    sec = int(sec or 0)
+    return "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
+
+
+def export_blocks(title, snap):
+    """The whole project as one Word file: per recording, its AI summary (if any) and the text."""
+    b = [("title", title)]
+    for j in snap:
+        b.append(("h", os.path.splitext(j["name"])[0]))
+        meta = "אורך: %s" % mmss(j.get("duration") or 0)
+        if j.get("created"):
+            meta += " · " + time.strftime("%d.%m.%Y %H:%M", time.localtime(j["created"]))
+        b.append(("p", meta))
+        if j.get("ai"):
+            for kind, t in ai.as_blocks(j["ai"])[1:]:
+                b.append(("h2" if kind == "h" else kind, t))
+            b.append(("h2", "תמלול"))
+        text = j.get("edited") or engine.plain_text(j.get("segments") or [])
+        b += [("p", p) for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
+    return b
 
 
 def public(job):
@@ -185,6 +256,16 @@ def public(job):
             "ai_state", "ai_msg", "ai_error", "ai", "edited", "done_tasks")
     d = {k: job.get(k) for k in keys}
     d["text"] = engine.plain_text(job.get("segments", []))
+    d["has_audio"] = bool(audio_of(job))
+    d["created"] = job.get("created")
+    if job.get("state") == "running" and job.get("started"):
+        el = time.time() - job["started"]
+        p = job.get("progress") or 0
+        d["eta"] = el * (100 - p) / p if p >= 3 and el > 8 else None
+    if job.get("state") == "queued":
+        d["ahead"] = sum(1 for i in order if i in jobs and i != job["id"] and
+                         jobs[i]["state"] in ("queued", "running") and
+                         (jobs[i].get("created") or 0) <= (job.get("created") or 0))
     return d
 
 
@@ -223,13 +304,88 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_file(self, path):
+        """Serves a media file with Range support, so the <audio> element can seek."""
+        size = os.path.getsize(path)
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if path.lower().endswith(".webm"):
+            ctype = "audio/webm"
+        start, end = 0, size - 1
+        rng = self.headers.get("Range") or ""
+        partial = rng.startswith("bytes=") and size > 0
+        if partial:
+            try:
+                a, _, b = rng[6:].split(",")[0].strip().partition("-")
+                if a:
+                    start, end = int(a), (int(b) if b else size - 1)
+                else:
+                    start = max(0, size - int(b))
+                end = min(end, size - 1)
+                if start > end:
+                    raise ValueError
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if partial:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(left, 1 << 18))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except OSError:
+            pass   # the player dropped the request (a seek): normal
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        if u.path == "/api/ping":
+            return self.send(200, {"app": appbase.APP_ID})
+        if not appbase.request_ok(self, self.server.server_address[1], False):
+            return self.send(403, {"error": "forbidden"})
         last_ping[0] = time.time()
         if u.path == "/":
             with open(UI, "rb") as f:
                 return self.send(200, f.read(), "text/html; charset=utf-8")
+        if u.path in STATIC:
+            fn, ctype = STATIC[u.path]
+            with open(os.path.join(engine.HERE, fn), "rb") as f:
+                return self.send(200, f.read(), ctype)
+        if u.path == "/api/audio":
+            job = jobs.get((q.get("id") or [""])[0])
+            p = audio_of(job) if job else None
+            if not p:
+                return self.send(404, {"error": "no audio"})
+            return self.send_file(p)
+        if u.path == "/api/segments":
+            job = jobs.get((q.get("id") or [""])[0])
+            if not job:
+                return self.send(404, {"error": "not found"})
+            return self.send(200, {"segments": job.get("segments") or []})
+        if u.path == "/api/project/export":
+            with lock:
+                snap = [jobs[i] for i in order if i in jobs and jobs[i]["state"] == "done"]
+            if not snap:
+                return self.send(404, {"error": "empty"})
+            title = project["name"] or "פרויקט"
+            data = engine.docx_from_blocks(export_blocks(title, snap))
+            cd = "attachment; filename*=UTF-8''" + urllib.parse.quote(safe_name(title) + ".docx")
+            return self.send(200, data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                             {"Content-Disposition": cd})
         if u.path == "/icon.ico":
             with open(os.path.join(engine.HERE, "icon.ico"), "rb") as f:
                 return self.send(200, f.read(), "image/x-icon")
@@ -262,12 +418,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        if not appbase.request_ok(self, self.server.server_address[1], True):
+            return self.send(403, {"error": "forbidden"})
         last_ping[0] = time.time()
         if u.path == "/api/upload":
             name = safe_name((q.get("name") or ["audio"])[0])
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0:
                 return self.send(400, {"error": "empty"})
+            free = appbase.free_bytes(OUT_DIR)
+            if free is not None and free < length * 2 + (500 << 20):
+                return self.send(507, {"error": "אין מספיק מקום פנוי בדיסק לקובץ הזה."})
             os.makedirs(WORK_DIR, exist_ok=True)
             jid = uuid.uuid4().hex[:12]
             path = os.path.join(WORK_DIR, jid + "_" + name)
@@ -326,6 +487,11 @@ class Handler(BaseHTTPRequestHandler):
                 if job and job["state"] in ("queued",):
                     job["state"] = "cancelled"
                 if job and job["state"] != "running":
+                    if job.get("path") and os.path.dirname(job["path"]) == WORK_DIR:
+                        try:
+                            os.remove(job["path"])   # never transcribed: nothing points at it
+                        except OSError:
+                            pass
                     jobs.pop(jid, None)
                     if jid in order:
                         order.remove(jid)
@@ -339,6 +505,25 @@ class Handler(BaseHTTPRequestHandler):
             if job:
                 job["edited"] = text or None
                 touch()
+            return self.send(200, {"ok": True})
+        if u.path == "/api/rename":
+            job = jobs.get((q.get("id") or [""])[0])
+            name = ((q.get("name") or [""])[0]).strip()
+            if not job or not name:
+                return self.send(400, {"error": "bad"})
+            ext = os.path.splitext(job["name"])[1]
+            name = safe_name(name)
+            job["name"] = name if not ext or name.lower().endswith(ext.lower()) else name + ext
+            touch()
+            return self.send(200, {"ok": True, "name": job["name"]})
+        if u.path == "/api/retry":
+            job = jobs.get((q.get("id") or [""])[0])
+            p = audio_of(job) if job else None
+            if not job or job["state"] != "error" or not p:
+                return self.send(400, {"error": "no audio"})
+            job.update(state="queued", error=None, progress=0.0, segments=[], path=p)
+            touch()
+            todo.put(job["id"])
             return self.send(200, {"ok": True})
         if u.path == "/api/task":
             job = jobs.get((q.get("id") or [""])[0])
@@ -354,8 +539,12 @@ class Handler(BaseHTTPRequestHandler):
             name = ((q.get("name") or [""])[0]).strip()[:120] or project["name"] or "פרויקט ללא שם"
             with lock:
                 snap = [jobs[i] for i in order if i in jobs]
-            pid = projects.save(project["id"], name, snap)
-            project.update(id=pid, name=name, dirty=False)
+            try:
+                pid = projects.save(project["id"], name, snap)
+            except OSError as e:
+                return self.send(500, {"error": "השמירה נכשלה: %s" % e})
+            project.update(id=pid, name=name, dirty=False, restored=False)
+            autosave_now()
             log("project saved: %s (%d recordings)" % (name, len(snap)))
             return self.send(200, {"ok": True, "id": pid})
         if u.path in ("/api/project/new", "/api/project/open"):
@@ -369,6 +558,8 @@ class Handler(BaseHTTPRequestHandler):
                 except (OSError, ValueError):
                     return self.send(404, {"error": "not found"})
                 replace_jobs(d.get("jobs") or [], d.get("id"), d.get("name") or "")
+            project["restored"] = False
+            autosave_now()
             return self.send(200, {"ok": True})
         if u.path == "/api/project/delete":
             pid = (q.get("id") or [""])[0]
@@ -386,6 +577,7 @@ def idle_watch(server):
         limit = IDLE_EXIT_SEC if win["app"] else IDLE_EXIT_BROWSER_SEC
         if not busy() and (win["closed"] or time.time() - last_ping[0] > limit):
             log("window closed / no page - exiting")
+            autosave_now()   # unsaved work comes back on the next start
             server.shutdown()
             return
 
@@ -399,15 +591,31 @@ def watch_window(proc):
         win["closed"] = True
 
 
+def restore_autosave():
+    d = appbase.read_json(AUTOSAVE)
+    if not d or not d.get("jobs"):
+        return
+    p = d.get("project") or {}
+    replace_jobs(d["jobs"], p.get("id"), p.get("name") or "", dirty=True)
+    project["restored"] = True
+    log("restored %d unsaved recordings from autosave" % len(d["jobs"]))
+
+
 def main():
-    url = "http://127.0.0.1:%d/" % PORT
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    except OSError:
+        server, port = appbase.bind(Handler, PORT)
+    except OSError as e:
+        appbase.message_box("Hebrew Whisper could not start:\n%s" % e)
+        return 1
+    url = "http://127.0.0.1:%d/" % port
+    if server is None:
         # Already running (second double-click): just show the window again.
-        window.open_window(url)
+        if os.environ.get("HW_NO_BROWSER") != "1":
+            window.open_window(url)
         return 0
-    os.makedirs(OUT_DIR, exist_ok=True)
+    restore_autosave()
+    appbase.clean_incoming(WORK_DIR, {j.get("path") for j in jobs.values()})
+    threading.Thread(target=autosave_loop, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=idle_watch, args=(server,), daemon=True).start()
     log("Hebrew Whisper on %s" % url)
@@ -429,4 +637,12 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        log("FATAL\n" + traceback.format_exc())
+        appbase.message_box("Hebrew Whisper stopped because of an error.\nDetails: %s"
+                            % os.path.join(OUT_DIR, "_log.txt"))
+        sys.exit(1)

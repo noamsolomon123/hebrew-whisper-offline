@@ -82,6 +82,13 @@ if ($LASTEXITCODE -ne 0) { Fail 'pip install' }
 if ($LASTEXITCODE -ne 0) { Fail 'import test' }
 # pip is not needed on the far side; drop its caches to keep the bundle small
 Get-ChildItem -LiteralPath $pyDir -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
+# ctranslate2 / onnxruntime need the MSVC C++ runtime; the offline PC may not have it installed.
+$sys32 = Join-Path $env:SystemRoot 'System32'
+foreach ($dll in @('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'concrt140.dll')) {
+  $src = Join-Path $sys32 $dll
+  if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $pyDir -Force }
+  else { Write-Host "  WARNING: $dll not found in System32 (install the VC++ 2015-2022 x64 runtime on this PC and run again)" }
+}
 $ErrorActionPreference = 'Stop'
 
 # ---- 3. model -------------------------------------------------------------------------
@@ -103,7 +110,7 @@ if ((Sha256File (Join-Path $modelDir 'model.bin')) -ne $MODEL_BIN_SHA) {
 Step 'App files'
 $appDir = Join-Path $bundle 'app'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-foreach ($n in @('transcribe.py', 'server.py', 'ai.py', 'window.py', 'ui.html', 'icon.ico')) {
+foreach ($n in @('transcribe.py', 'server.py', 'ai.py', 'ai_prompts.py', 'ai_post.py', 'projects.py', 'appbase.py', 'window.py', 'ui.html', 'ui.css', 'ui.js', 'icon.ico')) {
   Copy-Item -LiteralPath (Join-Path $repo "app\$n") -Destination $appDir -Force
 }
 Copy-Item -LiteralPath (Join-Path $repo 'tests\sample-he.mp3') -Destination $appDir -Force

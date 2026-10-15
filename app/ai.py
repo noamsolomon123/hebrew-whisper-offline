@@ -10,18 +10,25 @@ import glob
 import json
 import os
 import re
+import socket
 import subprocess
+import threading
 import time
+import urllib.error
 import urllib.request
 
-PREFERRED = ["gemma4:26b", "gemma4:12b", "gemma4:latest", "gemma4:e4b", "qwen2.5:14b", "gemma4:e2b"]
+from ai_post import _dedupe_strs, _mmss, _repair, as_blocks, as_text, clean  # noqa: F401 (re-exported)
+from ai_prompts import FIX_JSON, MERGE_SYSTEM, PART_NOTE, SECTION_HE, SYSTEM
+
+PREFERRED = ["gemma4:26b", "gemma4:12b", "gemma4:latest", "gemma4:12b-it-qat", "gemma4:e4b",
+             "qwen2.5:14b", "gemma4:e2b"]
 PROBE_PORTS = list(range(11434, 11441))
 OWN_PORT = 11441
-NUM_CTX = 32768
-CHUNK_CHARS = 14000   # ~ one Hebrew chunk well inside NUM_CTX, with room for the answer
+CHUNK_CHARS = 14000   # ~ one Hebrew chunk (~5k tokens) well inside 16k ctx, with room for the answer
+NUM_PREDICT = 4096
 
 _proc = None
-_found = {"url": None, "model": None}
+_found = {"url": None, "model": None, "think": None}
 
 
 def _get(url, timeout=2.0):
@@ -35,14 +42,17 @@ def _post(url, body, timeout=900.0):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def _tags(url):
+def _tags(url, timeout=2.0):
     try:
-        return [m["name"] for m in _get(url + "/api/tags").get("models", [])]
+        return [m["name"] for m in _get(url + "/api/tags", timeout).get("models", [])]
     except Exception:
         return None
 
 
 def _pick(names):
+    want = os.environ.get("HW_AI_MODEL")
+    if want and want in names:
+        return want
     for p in PREFERRED:
         if p in names:
             return p
@@ -50,42 +60,57 @@ def _pick(names):
     return g[0] if g else None
 
 
+def _port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
 def _autopoint_dirs():
     # Per-user NSIS install: %LOCALAPPDATA%\Programs\AutoPoint by default; the uninstall key
-    # knows the real place if the owner picked another folder.
+    # knows the real place if the owner picked another folder (or a per-machine install).
     roots = []
     try:
         import winreg
         for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-            try:
-                k = winreg.OpenKey(hive, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
-            except OSError:
-                continue
-            for i in range(winreg.QueryInfoKey(k)[0]):
+            for path in (r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                         r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
                 try:
-                    sub = winreg.OpenKey(k, winreg.EnumKey(k, i))
-                    name = winreg.QueryValueEx(sub, "DisplayName")[0]
-                    if str(name).startswith("AutoPoint"):
-                        roots.append(winreg.QueryValueEx(sub, "InstallLocation")[0])
+                    k = winreg.OpenKey(hive, path)
                 except OSError:
-                    pass
+                    continue
+                for i in range(winreg.QueryInfoKey(k)[0]):
+                    try:
+                        sub = winreg.OpenKey(k, winreg.EnumKey(k, i))
+                        if str(winreg.QueryValueEx(sub, "DisplayName")[0]).lower().startswith("autopoint"):
+                            try:
+                                roots.append(winreg.QueryValueEx(sub, "InstallLocation")[0])
+                            except OSError:
+                                un = str(winreg.QueryValueEx(sub, "UninstallString")[0]).strip('"')
+                                roots.append(os.path.dirname(un.split('" ')[0]))
+                    except OSError:
+                        pass
     except ImportError:
         pass
     la = os.environ.get("LOCALAPPDATA", "")
     roots += [os.path.join(la, "Programs", "AutoPoint"), os.path.join(la, "Programs", "autopoint")]
-    return [r for r in roots if r and os.path.isdir(r)]
-
-
-def _has_models(d):
-    return os.path.isdir(os.path.join(d, "manifests", "registry.ollama.ai", "library"))
+    for pf in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if pf:
+            roots.append(os.path.join(pf, "AutoPoint"))
+    out = []
+    for r in roots:
+        r = (r or "").strip().strip('"')
+        if r and os.path.isdir(r) and r not in out:
+            out.append(r)
+    return out
 
 
 def _local_models(d):
     lib = os.path.join(d, "manifests", "registry.ollama.ai", "library")
-    out = []
-    for p in glob.glob(os.path.join(lib, "*", "*")):
-        out.append(os.path.basename(os.path.dirname(p)) + ":" + os.path.basename(p))
-    return out
+    return [os.path.basename(os.path.dirname(p)) + ":" + os.path.basename(p)
+            for p in glob.glob(os.path.join(lib, "*", "*"))]
 
 
 def _find_exe_and_models():
@@ -93,18 +118,37 @@ def _find_exe_and_models():
     models = os.environ.get("HW_OLLAMA_MODELS")
     if not exe:
         for r in _autopoint_dirs():
-            c = os.path.join(r, "resources", "ollama", "ollama.exe")
-            if os.path.isfile(c):
-                exe = c
+            for c in (os.path.join(r, "resources", "ollama", "ollama.exe"),
+                      os.path.join(r, "resources", "app.asar.unpacked", "ollama", "ollama.exe")):
+                if os.path.isfile(c):
+                    exe = c
+                    break
+            if exe:
                 break
     if not models:
-        cands = [os.path.join(os.environ.get("APPDATA", ""), "AutoPoint", "ollama", "models"),
-                 os.path.join(os.environ.get("APPDATA", ""), "autopoint", "ollama", "models")]
+        ad = os.environ.get("APPDATA", "")
+        cands = [os.path.join(ad, "AutoPoint", "ollama", "models"), os.path.join(ad, "autopoint", "ollama", "models")]
         if exe:
             cands.insert(0, os.path.join(os.path.dirname(exe), "models"))
+        if os.environ.get("OLLAMA_MODELS"):
+            cands.append(os.environ["OLLAMA_MODELS"])
         cands.append(os.path.join(os.path.expanduser("~"), ".ollama", "models"))
-        models = next((c for c in cands if _has_models(c) and _pick(_local_models(c))), None)
+        models = next((c for c in cands if _pick(_local_models(c))), None)
     return exe, models
+
+
+def _probe(urls):
+    """Asks all candidate ports at once (a hung port costs 2 s, not 2 s each)."""
+    res = {}
+
+    def one(u):
+        res[u] = _tags(u)
+    ts = [threading.Thread(target=one, args=(u,), daemon=True) for u in urls]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(3)
+    return [(u, res.get(u)) for u in urls]
 
 
 def connect(log=print):
@@ -113,41 +157,56 @@ def connect(log=print):
     if _found["url"] and _tags(_found["url"]) is not None:
         return _found["url"], _found["model"]
     if os.environ.get("HW_OLLAMA_URL"):
-        ports = []
         urls = [os.environ["HW_OLLAMA_URL"].rstrip("/")]
-    else:
-        ports = PROBE_PORTS + [OWN_PORT]
-        urls = ["http://127.0.0.1:%d" % p for p in ports]
-    for url in urls:
-        names = _tags(url)
-        if names and _pick(names):
-            _found.update(url=url, model=_pick(names))
+        names = _tags(urls[0], 5)
+        if names is None:
+            raise RuntimeError("מנוע ה-AI לא עונה בכתובת %s (HW_OLLAMA_URL)." % urls[0])
+        if not _pick(names):
+            raise RuntimeError("במנוע ה-AI בכתובת %s אין מודל gemma4." % urls[0])
+        _found.update(url=urls[0], model=_pick(names), think=None)
+        return urls[0], _found["model"]
+    running_without_model = False
+    for url, names in _probe(["http://127.0.0.1:%d" % p for p in PROBE_PORTS + [OWN_PORT]]):
+        if names is None:
+            continue
+        if _pick(names):
+            _found.update(url=url, model=_pick(names), think=None)
             log("AI: using running Ollama %s, model %s" % (url, _found["model"]))
             return url, _found["model"]
+        running_without_model = True
     exe, models = _find_exe_and_models()
     if not exe:
-        raise RuntimeError("לא נמצא AutoPoint במחשב הזה (ה-AI מגיע ממנו). אפשר לפתוח את AutoPoint ולנסות שוב.")
+        raise RuntimeError("לא נמצא AutoPoint במחשב הזה, וה-AI מגיע ממנו. "
+                           "אם AutoPoint מותקן - לפתוח אותו פעם אחת ולנסות שוב.")
     if not models:
-        raise RuntimeError("נמצא AutoPoint אבל בלי מודלי AI מותקנים (הגדרות > התקנת מודלים).")
-    env = dict(os.environ, OLLAMA_HOST="127.0.0.1:%d" % OWN_PORT, OLLAMA_MODELS=models,
-               OLLAMA_NOPRUNE="1")
-    log("AI: starting %s on %d (models %s)" % (exe, OWN_PORT, models))
-    _proc = subprocess.Popen([exe, "serve"], env=env, cwd=os.path.dirname(exe),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    url = "http://127.0.0.1:%d" % OWN_PORT
+        raise RuntimeError("נמצא AutoPoint, אבל בלי מודל gemma4 מותקן. "
+                           "ב-AutoPoint: הגדרות > התקנת מודלים, ואז לנסות שוב."
+                           + (" (יש מנוע AI פתוח, אבל בלי gemma4.)" if running_without_model else ""))
+    port = next((p for p in range(OWN_PORT, OWN_PORT + 5) if not _port_open(p)), None)
+    if port is None:
+        raise RuntimeError("אין פורט פנוי להפעלת מנוע ה-AI (11441-11445 תפוסים).")
+    env = dict(os.environ, OLLAMA_HOST="127.0.0.1:%d" % port, OLLAMA_MODELS=models, OLLAMA_NOPRUNE="1")
+    log("AI: starting %s on %d (models %s)" % (exe, port, models))
+    try:
+        _proc = subprocess.Popen([exe, "serve"], env=env, cwd=os.path.dirname(exe),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        raise RuntimeError("לא הצלחתי להפעיל את מנוע ה-AI של AutoPoint (%s)." % e)
+    url = "http://127.0.0.1:%d" % port
     for _ in range(120):
         time.sleep(0.5)
         names = _tags(url)
         if names is not None:
             m = _pick(names)
             if not m:
-                raise RuntimeError("אין מודל gemma4 בתיקיית המודלים של AutoPoint.")
-            _found.update(url=url, model=m)
+                raise RuntimeError("מנוע ה-AI עלה, אבל אין בו מודל gemma4 (תיקיית מודלים: %s)." % models)
+            _found.update(url=url, model=m, think=None)
             return url, m
         if _proc.poll() is not None:
             break
-    raise RuntimeError("מנוע ה-AI של AutoPoint לא עלה. אולי AutoPoint פתוח ומשתמש בו - לסגור ולנסות שוב.")
+    raise RuntimeError("מנוע ה-AI של AutoPoint לא עלה. אם AutoPoint פתוח - לסגור אותו ולנסות שוב, "
+                       "או לפתוח אותו ולחכות שה-AI שלו יעלה.")
 
 
 def stop():
@@ -164,30 +223,6 @@ def unload():
         _post(url + "/api/generate", {"model": model, "keep_alive": 0}, timeout=20).read()
     except Exception:
         pass
-
-
-SYSTEM = (
-    "אתה עוזר שמסדר תמלולים של הקלטות בעברית (ישיבות, שיחות, הרצאות, הודעות קוליות). "
-    "התמלול נוצר אוטומטית ועלול להכיל טעויות זיהוי - תבין לפי ההקשר. "
-    "כתוב הכל בעברית תקנית, ברורה וקצרה. אל תמציא פרטים שלא נאמרו. "
-    "אם משהו לא נאמר (למשל מי אחראי או תאריך יעד) - השאר מחרוזת ריקה. "
-    "ענה ב-JSON בלבד, בדיוק במבנה הזה:\n"
-    '{"title": "כותרת קצרה להקלטה",\n'
-    ' "summary": "סיכום של 2-5 משפטים",\n'
-    ' "key_points": ["נקודה חשובה", "..."],\n'
-    ' "topics": [{"title": "נושא", "time": "mm:ss", "points": ["מה נאמר עליו", "..."]}],\n'
-    ' "tasks": [{"task": "מה צריך לעשות", "owner": "מי", "due": "מתי", "time": "mm:ss"}],\n'
-    ' "decisions": ["החלטה שהתקבלה", "..."],\n'
-    ' "timeline": [{"time": "mm:ss", "event": "מה קרה בנקודה הזאת בהקלטה"}],\n'
-    ' "open_questions": ["שאלה שנשארה פתוחה", "..."]}\n'
-    "ה-time הוא הזמן בהקלטה לפי הסימונים [mm:ss] בתמלול (אם אין סימונים - מחרוזת ריקה). "
-    "ציר הזמן: 4-12 נקודות לפי סדר. רשימה ריקה [] אם אין מה לכתוב בה."
-)
-
-
-def _mmss(sec):
-    sec = int(sec or 0)
-    return "%d:%02d" % (sec // 60, sec % 60) if sec < 3600 else "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60)
 
 
 def transcript_lines(segs):
@@ -207,64 +242,72 @@ def _chunks(lines):
     return out
 
 
-def _chat(url, model, system, user, on_tokens=None):
-    body = {"model": model, "stream": True, "format": "json", "keep_alive": "5m",
+def _ctx_for(chars):
+    # Hebrew is ~3 chars/token for gemma; one size per recording so chunks never reload the model.
+    need = chars // 3 + 2500 + NUM_PREDICT
+    return 8192 if need <= 8192 else 16384 if need <= 16384 else 32768
+
+
+def _chat(url, model, system, user, num_ctx, on_text=None, temperature=0.2):
+    body = {"model": model, "stream": True, "format": "json", "keep_alive": "10m",
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "options": {"temperature": 0.2, "num_ctx": NUM_CTX, "num_predict": 4096}}
-    try:
-        caps = json.loads(_post(url + "/api/show", {"model": model}, timeout=30).read()).get("capabilities") or []
-        if "thinking" in caps:
-            body["think"] = False
-    except Exception:
-        pass
+            "options": {"temperature": temperature, "top_p": 0.9, "num_ctx": num_ctx,
+                        "num_predict": NUM_PREDICT, "repeat_penalty": 1.05}}
+    if _found.get("think") is None:
+        try:
+            caps = json.loads(_post(url + "/api/show", {"model": model}, timeout=30).read()).get("capabilities") or []
+            _found["think"] = "thinking" in caps
+        except Exception:
+            _found["think"] = False
+    if _found["think"]:
+        body["think"] = False
     parts = []
-    with _post(url + "/api/chat", body) as r:
-        for line in r:
-            if not line.strip():
-                continue
-            d = json.loads(line)
-            if d.get("error"):
-                raise RuntimeError(d["error"])
-            parts.append((d.get("message") or {}).get("content", ""))
-            if on_tokens:
-                on_tokens(len(parts))
-            if d.get("done"):
-                break
+    try:
+        with _post(url + "/api/chat", body) as r:
+            for line in r:
+                if not line.strip():
+                    continue
+                d = json.loads(line)
+                if d.get("error"):
+                    raise RuntimeError(d["error"])
+                parts.append((d.get("message") or {}).get("content", ""))
+                if on_text and len(parts) % 8 == 0:
+                    on_text("".join(parts))
+                if d.get("done"):
+                    break
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError("מנוע ה-AI החזיר שגיאה (%d): %s" % (e.code, msg))
+    except (urllib.error.URLError, ConnectionError, socket.timeout) as e:
+        _found["url"] = None
+        raise RuntimeError("החיבור למנוע ה-AI נותק (%s). לנסות שוב; אם חוזר - לפתוח מחדש את התוכנה." % e)
     return "".join(parts)
 
 
-def _parse(raw):
-    raw = raw.strip()
-    m = re.search(r"\{.*\}", raw, re.S)
-    data = json.loads(m.group(0) if m else raw)
-    return clean(data)
+def _progress(say, where):
+    state = {"sec": None, "t": 0.0}
+
+    def on_text(txt):
+        keys = re.findall(r'"(%s)"\s*:' % "|".join(SECTION_HE), txt)
+        sec = keys[-1] if keys else None
+        now = time.time()
+        if sec != state["sec"] or now - state["t"] > 3:
+            state.update(sec=sec, t=now)
+            say(("כותב%s: %s…" % (where, SECTION_HE[sec])) if sec else ("מסדר%s…" % where))
+    return on_text
 
 
-def clean(d):
-    def strs(x):
-        return [str(s).strip() for s in (x or []) if str(s).strip()] if isinstance(x, list) else []
-
-    def objs(x, keys):
-        out = []
-        for o in x if isinstance(x, list) else []:
-            if isinstance(o, dict):
-                out.append({k: (strs(o.get(k)) if k == "points" else str(o.get(k) or "").strip()) for k in keys})
-            elif str(o).strip():
-                out.append({k: (str(o).strip() if i == 0 else ([] if k == "points" else ""))
-                            for i, k in enumerate(keys)})
-        return out
-
-    d = d if isinstance(d, dict) else {}
-    return {
-        "title": str(d.get("title") or "").strip(),
-        "summary": str(d.get("summary") or "").strip(),
-        "key_points": strs(d.get("key_points")),
-        "topics": objs(d.get("topics"), ["title", "time", "points"]),
-        "tasks": [t for t in objs(d.get("tasks"), ["task", "owner", "due", "time"]) if t["task"]],
-        "decisions": strs(d.get("decisions")),
-        "timeline": [t for t in objs(d.get("timeline"), ["time", "event"]) if t["event"]],
-        "open_questions": strs(d.get("open_questions")),
-    }
+def _ask(url, model, system, user, num_ctx, on_text, log):
+    raw = _chat(url, model, system, user, num_ctx, on_text)
+    try:
+        return _repair(raw)
+    except ValueError:
+        log("AI: invalid JSON, retrying once (%d chars)" % len(raw))
+        raw = _chat(url, model, system, user + "\n\n" + FIX_JSON, num_ctx, on_text, temperature=0.0)
+        try:
+            return _repair(raw)
+        except ValueError:
+            raise RuntimeError("מודל ה-AI החזיר פעמיים תשובה לא תקינה. לנסות שוב.")
 
 
 def organize(segs, name, edited_text=None, progress=None, log=print):
@@ -272,83 +315,61 @@ def organize(segs, name, edited_text=None, progress=None, log=print):
     say = progress or (lambda msg: None)
     say("מתחבר למנוע ה-AI…")
     url, model = connect(log)
-    lines = edited_text.splitlines() if edited_text else transcript_lines(segs)
-    parts = _chunks([l for l in lines if l.strip()])
+    if edited_text and edited_text.strip():
+        lines = [l for l in edited_text.splitlines() if l.strip()]
+        timed, dur = None, 0
+    else:
+        lines = transcript_lines(segs)
+        timed = [(a, t.strip()) for a, _, t in segs if t.strip()]
+        dur = max((b for _, b, _ in segs), default=0) or None
+    if not lines:
+        raise RuntimeError("אין טקסט לסדר - התמלול ריק.")
+    src = " ".join(re.sub(r"^\[[\d:]+\]\s*", "", l) for l in lines)
+    parts = _chunks(lines)
+    num_ctx = _ctx_for(max(len(p) for p in parts))
+    t0 = time.time()
     results = []
     for i, part in enumerate(parts, 1):
         where = "" if len(parts) == 1 else " (חלק %d מתוך %d)" % (i, len(parts))
-        say("טוען את %s לזיכרון…" % model if i == 1 else "מסדר" + where + "…")
-        user = "שם הקובץ: %s\n\nהתמלול:\n%s" % (name, part)
-        raw = _chat(url, model, SYSTEM, user,
-                    lambda n: say("מסדר" + where + "… (%d)" % n))
-        try:
-            results.append(_parse(raw))
-        except Exception:
-            raw = _chat(url, model, SYSTEM, user + "\n\nענה ב-JSON תקין בלבד.")
-            results.append(_parse(raw))
+        say(("טוען את %s לזיכרון…" % model) if i == 1 else "מסדר" + where + "…")
+        note = PART_NOTE % (i, len(parts)) if len(parts) > 1 else ""
+        user = "שם הקובץ: %s\n%s\nהתמלול:\n%s" % (name, note, part)
+        data = _ask(url, model, SYSTEM, user, num_ctx, _progress(say, where), log)
+        results.append(clean(data, src, dur, timed))
     if len(results) == 1:
         out = results[0]
     else:
-        out = {k: [] for k in ("key_points", "topics", "tasks", "decisions", "timeline", "open_questions")}
-        for r in results:
-            for k in out:
-                out[k] += r[k]
-        say("מסכם את כל החלקים…")
-        merged = "\n".join("- " + r["summary"] for r in results if r["summary"])
-        raw = _chat(url, model,
-                    'סכם בעברית. ענה ב-JSON בלבד: {"title": "כותרת קצרה", "summary": "2-5 משפטים"}',
-                    "סיכומי החלקים של אותה הקלטה (%s):\n%s" % (name, merged))
-        try:
-            top = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
-        except Exception:
-            top = {}
-        out["title"] = str(top.get("title") or results[0]["title"])
-        out["summary"] = str(top.get("summary") or " ".join(r["summary"] for r in results))
+        out = _merge(results, url, model, name, num_ctx, say, log, src, dur, timed)
+    log("AI: organized in %.0f s (%d part(s), ctx %d)" % (time.time() - t0, len(parts), num_ctx))
     out["model"] = model
     return out
 
 
-def as_blocks(r):
-    """The organized result as (kind, text) blocks, for Word and for plain-text copy."""
-    b = [("title", r.get("title") or "סיכום")]
-    if r.get("summary"):
-        b += [("h", "סיכום"), ("p", r["summary"])]
-    if r.get("key_points"):
-        b += [("h", "נקודות עיקריות")] + [("li", x) for x in r["key_points"]]
-    if r.get("tasks"):
-        b.append(("h", "משימות"))
-        for t in r["tasks"]:
-            extra = " · ".join(x for x in (t["owner"] and "אחראי: " + t["owner"],
-                                           t["due"] and "עד: " + t["due"]) if x)
-            b.append(("task", t["task"] + (" (" + extra + ")" if extra else "")))
-    if r.get("decisions"):
-        b += [("h", "החלטות")] + [("li", x) for x in r["decisions"]]
-    if r.get("timeline"):
-        b += [("h", "ציר זמן")] + [("li", (t["time"] + " - " if t["time"] else "") + t["event"])
-                                     for t in r["timeline"]]
-    if r.get("topics"):
-        b.append(("h", "נושאים"))
-        for t in r["topics"]:
-            b.append(("h2", t["title"] + ("  (" + t["time"] + ")" if t["time"] else "")))
-            b += [("li", p) for p in t["points"]]
-    if r.get("open_questions"):
-        b += [("h", "שאלות פתוחות")] + [("li", x) for x in r["open_questions"]]
-    return b
-
-
-def as_text(r):
-    out = []
-    for kind, t in as_blocks(r):
-        if kind == "title":
-            out += [t, "=" * min(len(t), 40)]
-        elif kind == "h":
-            out += ["", t]
-        elif kind == "h2":
-            out += ["", "  " + t]
-        elif kind == "task":
-            out.append("☐ " + t)
-        elif kind == "li":
-            out.append("• " + t)
-        else:
-            out.append(t)
-    return "\n".join(out).strip() + "\n"
+def _merge(results, url, model, name, num_ctx, say, log, src, dur, timed):
+    """Joins chunk results: one summary over all parts, lists deduped and kept in time order."""
+    say("מסכם את כל החלקים…")
+    joined = {"tasks": [], "topics": [], "timeline": [], "speakers": [], "decisions": [],
+              "open_questions": [], "key_points": []}
+    for r in results:
+        for k in joined:
+            joined[k] += r[k]
+    merged = clean(joined, src, dur, timed)
+    tl = merged["timeline"]
+    if len(tl) > 14:  # keep it a readable overview: evenly spaced
+        step = len(tl) / 14.0
+        merged["timeline"] = [tl[int(i * step)] for i in range(14)]
+    digest = "\n\n".join("חלק %d:\n%s\nנקודות: %s" % (i, r["summary"], "; ".join(r["key_points"][:8]))
+                         for i, r in enumerate(results, 1))
+    try:
+        top = _ask(url, model, MERGE_SYSTEM, "הקלטה: %s\n\n%s" % (name, digest), num_ctx,
+                   _progress(say, " (סיכום כללי)"), log)
+    except Exception as e:  # noqa - the parts are still useful without the overall summary
+        log("AI: merge summary failed: %s" % e)
+        top = {}
+    top = top if isinstance(top, dict) else {}
+    kp = [str(x).strip() for x in (top.get("key_points") or []) if str(x).strip()] if isinstance(top.get("key_points"), list) else []
+    merged["title"] = str(top.get("title") or results[0]["title"]).strip()
+    merged["summary"] = str(top.get("summary") or " ".join(r["summary"] for r in results)).strip()
+    merged["key_points"] = _dedupe_strs(kp) or merged["key_points"][:10]
+    merged["kind"] = results[0].get("kind", "")
+    return merged
