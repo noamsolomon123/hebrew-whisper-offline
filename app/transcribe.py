@@ -63,7 +63,7 @@ def pick_device():
     return "cuda" if n > 0 else "cpu"
 
 
-def run(path, device):
+def run(path, device, on_progress=None):
     model = get_model(device)
     segments, info = model.transcribe(path, language="he", task="transcribe", beam_size=5,
                                       vad_filter=True, condition_on_previous_text=False)
@@ -71,17 +71,19 @@ def run(path, device):
     for s in segments:
         out.append((s.start, s.end, s.text.strip()))
         pct = 100.0 * s.end / info.duration if info.duration else 0
+        if on_progress:
+            on_progress(min(pct, 100.0), out)
         print("\r  %5.1f%%  (%s / %s)" % (min(pct, 100), ts(s.end, "."), ts(info.duration, ".")),
               end="", flush=True)
     print()
     return out, info.duration
 
 
-def transcribe(path):
+def transcribe(path, on_progress=None):
     if state["device"] is None:
         state["device"] = pick_device()
     try:
-        return run(path, state["device"])
+        return run(path, state["device"], on_progress)
     except Exception as e:
         gpu_words = ("cuda", "cublas", "cudnn", "gpu", "device", "memory", "dll", "driver")
         if state["device"] != "cuda" or not any(w in str(e).lower() for w in gpu_words):
@@ -90,7 +92,7 @@ def transcribe(path):
         print("  GPU failed (%s)" % str(e).splitlines()[0][:200])
         print("  Switching to CPU - slower, same text.")
         state["device"] = "cpu"
-        return run(path, "cpu")
+        return run(path, "cpu", on_progress)
 
 
 def ts(sec, sep=","):
