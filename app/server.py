@@ -32,6 +32,8 @@ import ai  # noqa: E402
 import projects  # noqa: E402
 import window  # noqa: E402
 import transcribe as engine  # noqa: E402
+import updates  # noqa: E402
+from version import VERSION  # noqa: E402
 
 PORT = int(os.environ.get("HW_PORT", "8765"))
 projects.DIR = os.path.join(OUT_DIR, "_projects")
@@ -53,6 +55,14 @@ status = {"model": "loading", "device": None, "error": None}
 last_ping = [time.time()]
 project = {"id": None, "name": "", "dirty": False, "restored": False}  # unsaved until Save
 autosave_due = [False]
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+upd = updates.Updates(engine.ROOT, log)
+srv = {"server": None}
 
 
 def touch():
@@ -80,10 +90,6 @@ def autosave_loop():
         time.sleep(3)
         if autosave_due[0]:
             autosave_now()
-
-
-def log(msg):
-    print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
 def safe_name(name):
@@ -354,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/api/ping":
-            return self.send(200, {"app": appbase.APP_ID})
+            return self.send(200, {"app": appbase.APP_ID, "version": VERSION})
         if not appbase.request_ok(self, self.server.server_address[1], False):
             return self.send(403, {"error": "forbidden"})
         last_ping[0] = time.time()
@@ -392,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             with lock:
                 return self.send(200, {"model": status, "out_dir": OUT_DIR, "project": project,
+                                       "version": VERSION, "update": upd.state(),
                                        "jobs": [public(jobs[i]) for i in order if i in jobs]})
         if u.path == "/api/history":
             return self.send(200, {"projects": projects.listing()})
@@ -561,6 +568,29 @@ class Handler(BaseHTTPRequestHandler):
             project["restored"] = False
             autosave_now()
             return self.send(200, {"ok": True})
+        if u.path == "/api/update/folder":
+            length = int(self.headers.get("Content-Length") or 0)
+            path = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            try:
+                return self.send(200, upd.set_folder(path))
+            except (ValueError, OSError) as e:
+                return self.send(400, {"error": str(e)})
+        if u.path == "/api/update/check":
+            return self.send(200, upd.check())
+        if u.path == "/api/update/apply":
+            if busy():
+                return self.send(409, {"error": "busy"})
+            upd.check()
+            if not upd.found:
+                return self.send(404, {"error": "no update"})
+            autosave_now()   # the open recordings come back after the restart
+            try:
+                upd.apply()
+            except OSError as e:
+                return self.send(500, {"error": "העדכון לא הופעל: %s" % e})
+            # Leave a moment for this answer to reach the page, then close: the installer waits for it.
+            threading.Timer(0.8, lambda: srv["server"] and srv["server"].shutdown()).start()
+            return self.send(200, {"ok": True, "version": upd.found["version"]})
         if u.path == "/api/project/delete":
             pid = (q.get("id") or [""])[0]
             projects.delete(pid)
@@ -613,12 +643,14 @@ def main():
         if os.environ.get("HW_NO_BROWSER") != "1":
             window.open_window(url)
         return 0
+    srv["server"] = server
     restore_autosave()
     appbase.clean_incoming(WORK_DIR, {j.get("path") for j in jobs.values()})
     threading.Thread(target=autosave_loop, daemon=True).start()
+    threading.Thread(target=upd.loop, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=idle_watch, args=(server,), daemon=True).start()
-    log("Hebrew Whisper on %s" % url)
+    log("Hebrew Whisper %s on %s" % (VERSION, url))
     if os.environ.get("HW_NO_BROWSER") != "1":
         window.ensure_shortcut(engine.ROOT)
         proc = window.open_window(url)

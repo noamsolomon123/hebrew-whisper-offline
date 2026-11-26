@@ -421,7 +421,11 @@ def selftest():
     import ctranslate2
     import faster_whisper
     ok = True
-    print("Hebrew Whisper self-test")
+    try:
+        from version import VERSION
+    except ImportError:
+        VERSION = "?"
+    print("Hebrew Whisper %s self-test" % VERSION)
     print("  python          %s" % sys.version.split()[0])
     print("  faster-whisper  %s" % faster_whisper.__version__)
     print("  ctranslate2     %s" % ctranslate2.__version__)

@@ -180,7 +180,8 @@ async function poll() {
     const r = await fetch("/api/status", { cache: "no-store" });
     const d = await r.json();
     fails = 0; $("#gone").style.display = "none";
-    model = d.model; jobs = d.jobs; project = d.project; renderProject();
+    model = d.model; jobs = d.jobs; project = d.project; renderProject(); renderUpd(d);
+    if (updating) return;
     if (project.restored && !window._restoredShown) {
       window._restoredShown = true;
       toast("שוחזרה עבודה שלא נשמרה מהפעם הקודמת");
@@ -199,7 +200,7 @@ async function poll() {
     }
     renderList(); renderText();
   } catch (e) {
-    if (++fails > 3) $("#gone").style.display = "flex";
+    if (++fails > 3 && !updating) $("#gone").style.display = "flex";
   }
 }
 
@@ -730,5 +731,71 @@ $("#exportAll").onclick = async () => {
   toast("הקובץ נשמר בתיקיית ההורדות");
 };
 $("#openFolder").onclick = () => fetch("/api/open-folder");
+
+/* ---- software updates (kits in the updates folder, see updates.py) ---- */
+let upd = null, updating = null, updSeen = null, lastSeen = false;
+function renderUpd(d) {
+  upd = d.update || null;
+  $("#verSub").textContent = d.version ? "גרסה " + d.version : "";
+  if (updating) {   // the installer has the app closed and restarted it: reload into the new version
+    if (d.version && d.version !== updating.from) location.reload();
+    return;
+  }
+  if (!upd) return;
+  const a = upd.available, b = $("#updBtn");
+  b.classList.toggle("has", !!a);
+  b.textContent = a ? "עדכון זמין · " + a.version : "עדכונים";
+  if (a && updSeen !== a.version) { updSeen = a.version; toast("גרסה " + a.version + " מוכנה להתקנה · עדכונים"); }
+  if (upd.last && !lastSeen) {
+    lastSeen = true;
+    const l = upd.last;
+    if (l.ok && l.result === "ok") toast("עודכן לגרסה " + l.to);
+    else if (l.ok && l.result === "restored") toast("הוחזרה גרסה " + l.to);
+    else if (!l.ok) ask("העדכון לא הותקן", (l.error || "") + " · שום דבר לא השתנה.", [{ label: "סגירה" }]);
+  }
+  if ($("#updDlg").classList.contains("on")) paintUpd();
+}
+function paintUpd(msg, err) {
+  if (!upd) return;
+  $("#updVer").textContent = upd.version;
+  if (document.activeElement !== $("#updDir")) $("#updDir").value = upd.folder || "";
+  const m = $("#updMsg");
+  const a = upd.available;
+  m.className = "upd-msg" + (err || upd.error ? " err" : "");
+  m.textContent = msg || upd.error || (!upd.folder ? "עוד לא נבחרה תיקיית עדכונים." : a ? "" : "אין עדכון חדש בתיקייה. הגרסה המותקנת היא האחרונה.");
+  $("#updNew").hidden = !a;
+  if (a) {
+    $("#updNewV").textContent = a.version;
+    $("#updNotes").innerHTML = (a.notes || []).map(n => `<li>${esc(n)}</li>`).join("");
+  }
+}
+$("#updBtn").onclick = async () => {
+  $("#updDlg").classList.add("on"); paintUpd("מחפש…");
+  try { upd = await (await fetch("/api/update/check", { method: "POST" })).json(); paintUpd(); } catch (e) { paintUpd(); }
+};
+$("#updSave").onclick = async () => {
+  paintUpd("מחפש…");
+  const r = await fetch("/api/update/folder", { method: "POST", body: $("#updDir").value.trim() });
+  const d = await r.json();
+  if (!r.ok) return paintUpd(d.error || "שגיאה", true);
+  upd = d; $("#updDir").blur(); paintUpd();
+};
+$("#updDir").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); $("#updSave").click(); } };
+$("#updGo").onclick = async () => {   // open work is autosaved and comes back after the restart
+  if (anyBusy()) return toast("אפשר לעדכן כשאין תמלול או סידור AI באמצע");
+  const from = upd.version;
+  const r = await fetch("/api/update/apply", { method: "POST" });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    return paintUpd(r.status === 409 ? "יש עבודה באמצע. אפשר לעדכן כשהיא תסתיים." : (d.error || "העדכון לא הופעל"), true);
+  }
+  $("#updDlg").classList.remove("on");
+  updating = { from, t0: Date.now() };
+  $("#updating").style.display = "flex";
+  setInterval(() => {
+    if (Date.now() - updating.t0 > 240000)
+      $("#updatingT").textContent = "זה לוקח יותר מהרגיל. אם החלון לא חוזר: להפעיל את HEBREW-WHISPER.bat. פרטים: _updates\\update-log.txt";
+  }, 2000);
+};
 
 poll(); setInterval(poll, 1000);

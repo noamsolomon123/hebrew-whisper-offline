@@ -72,6 +72,8 @@ $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
 $ErrorActionPreference = 'Continue'
 if (-not (Test-Path -LiteralPath (Join-Path $pyDir 'Lib\site-packages\pip'))) {
   $gp = Join-Path $cache 'get-pip.py'
+  # Never "resume" this one: it changes upstream, and a resumed download is a broken script.
+  if (Test-Path -LiteralPath $gp) { Remove-Item -LiteralPath $gp -Force }
   Download $GETPIP $gp
   & $pyExe $gp --no-warn-script-location
   if ($LASTEXITCODE -ne 0) { Fail 'get-pip.py' }
@@ -98,6 +100,9 @@ New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
 foreach ($name in $MODEL_FILES) {
   $dest = Join-Path $modelDir $name
   if ($name -eq 'model.bin' -and (Test-Path -LiteralPath $dest) -and ((Sha256File $dest) -eq $MODEL_BIN_SHA)) { continue }
+  # the small files are pinned to one revision: one that is there is complete (curl -C - on a
+  # finished file is an error, so do not ask again)
+  if ($name -ne 'model.bin' -and (Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt 0) { continue }
   Download "https://huggingface.co/$MODEL_REPO/resolve/$MODEL_REV/$name" $dest
 }
 Write-Host '  verifying model.bin SHA-256...'
@@ -109,8 +114,11 @@ if ((Sha256File (Join-Path $modelDir 'model.bin')) -ne $MODEL_BIN_SHA) {
 # ---- 4. app ---------------------------------------------------------------------------
 Step 'App files'
 $appDir = Join-Path $bundle 'app'
+# From scratch: a file left from an older build (or a __pycache__ from a test run) must not ship.
+if (Test-Path -LiteralPath $appDir) { Remove-Item -LiteralPath $appDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-foreach ($n in @('transcribe.py', 'server.py', 'ai.py', 'ai_prompts.py', 'ai_post.py', 'projects.py', 'appbase.py', 'window.py', 'ui.html', 'ui.css', 'ui.js', 'icon.ico')) {
+foreach ($n in @('transcribe.py', 'server.py', 'ai.py', 'ai_prompts.py', 'ai_post.py', 'projects.py', 'appbase.py', 'window.py',
+                 'version.py', 'updates.py', 'apply_update.py', 'ui.html', 'ui.css', 'ui.js', 'icon.ico')) {
   Copy-Item -LiteralPath (Join-Path $repo "app\$n") -Destination $appDir -Force
 }
 Copy-Item -LiteralPath (Join-Path $repo 'tests\sample-he.mp3') -Destination $appDir -Force
@@ -120,6 +128,9 @@ foreach ($n in @('HEBREW-WHISPER.bat', 'TRANSCRIBE.bat', 'SELFTEST.bat', 'HOW-TO
 
 # ---- 5. manifest ----------------------------------------------------------------------
 Step 'manifest.sha256'
+Get-ChildItem -LiteralPath $bundle -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
+# (-Include does not filter together with -LiteralPath in PS 5.1: filter by name instead)
+Get-ChildItem -LiteralPath $bundle -Recurse -File | Where-Object { $_.Name -like '*.hw-new' -or $_.Name -like '*.hw-old' } | Remove-Item -Force
 $man = Join-Path $bundle 'manifest.sha256'
 if (Test-Path -LiteralPath $man) { Remove-Item -LiteralPath $man -Force }
 $root = (Get-Item -LiteralPath $bundle).FullName.TrimEnd('\') + '\'
@@ -131,6 +142,14 @@ Get-ChildItem -LiteralPath $bundle -Recurse -File | Sort-Object FullName | ForEa
 [System.IO.File]::WriteAllText($man, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 $size = (Get-ChildItem -LiteralPath $bundle -Recurse -File | Measure-Object Length -Sum).Sum
 Write-Host ('  bundle size {0:N1} GB' -f ($size / 1GB))
+# This version's file list: what a later update kit is compared against (build-update-kit.ps1).
+$verText = [System.IO.File]::ReadAllText((Join-Path $repo 'app\version.py'))
+if ($verText -match 'VERSION\s*=\s*"([0-9.]+)"') {
+  $relDir = Join-Path $OutRoot 'releases'
+  New-Item -ItemType Directory -Force -Path $relDir | Out-Null
+  Copy-Item -LiteralPath $man -Destination (Join-Path $relDir ($Matches[1] + '.manifest.sha256')) -Force
+  Write-Host ('  version {0} (file list kept in {1})' -f $Matches[1], $relDir)
+}
 
 # ---- 6. encode to text ----------------------------------------------------------------
 if ($SkipEncode) { Write-Host ''; Write-Host "DONE (not encoded): $bundle"; exit 0 }

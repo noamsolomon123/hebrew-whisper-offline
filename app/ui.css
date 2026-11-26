@@ -278,6 +278,20 @@ button.time:hover { background: rgba(155,124,240,.25); border-color: var(--ai); 
   position: fixed; inset: 0; background: rgba(17,19,23,.92); display: none; z-index: 30;
   align-items: center; justify-content: center; text-align: center; font-size: 16px;
 }
+#updating {
+  position: fixed; inset: 0; background: rgba(17,19,23,.94); display: none; z-index: 31;
+  align-items: center; justify-content: center; text-align: center; font-size: 16px; line-height: 1.7;
+}
+#updBtn.has { color: #fff; background: var(--accent2); border-color: var(--accent2); }
+.upd-ver { margin-bottom: 12px; }
+.upd-l { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+.dlg .upd-row { margin-top: 0; }
+.upd-row input { flex: 1; }
+.upd-msg { color: var(--muted); font-size: 13px; margin-top: 8px; min-height: 18px; }
+.upd-msg.err { color: #f08a8a; }
+.upd-new { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 15px; }
+.upd-notes { margin: 8px 0 0; padding-inline-start: 20px; color: var(--muted); font-size: 13.5px; }
+.upd-small { color: var(--muted); font-size: 12px; margin-top: 10px; }
 @media (max-width: 1050px) {
   main { grid-template-columns: 270px 1fr; }
   header .sub { display: none; }

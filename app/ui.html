@@ -11,8 +11,9 @@
 <header>
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#4f8cff" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v3"/></svg>
   <h1>תמלול עברית</h1>
-  <span class="sub">Whisper large-v3 · ivrit-ai · ללא אינטרנט</span>
+  <span class="sub">Whisper large-v3 · ivrit-ai · ללא אינטרנט · <span id="verSub"></span></span>
   <span class="spacer"></span>
+  <button id="updBtn" class="ghost" title="עדכוני תוכנה">עדכונים</button>
   <button id="keysBtn" class="ghost" title="קיצורי מקלדת" aria-label="קיצורי מקלדת">קיצורים</button>
   <span class="pill" role="status" aria-live="polite"><span id="mdot" class="dot busy"></span><span id="mtext">טוען מודל…</span></span>
 </header>
@@ -137,6 +138,23 @@
   <div class="dh"><b id="keysT">קיצורי מקלדת</b><span class="spacer"></span><button data-close>סגירה</button></div>
   <div class="db"><div class="keys" id="keysList"></div></div>
 </div></div>
+<div class="overlay" id="updDlg"><div class="dlg small" role="dialog" aria-modal="true" aria-labelledby="updT">
+  <div class="dh"><b id="updT">עדכוני תוכנה</b><span class="spacer"></span><button data-close>סגירה</button></div>
+  <div class="db">
+    <div class="upd-ver">גרסה מותקנת: <b id="updVer">—</b></div>
+    <label class="upd-l" for="updDir">תיקיית העדכונים (בוחרים פעם אחת; לשם מחלצים כל ערכת עדכון)</label>
+    <div class="row2 upd-row"><input type="text" id="updDir" placeholder="למשל \\PC\HebrewWhisper-Updates או D:\Updates" dir="ltr">
+      <button id="updSave">שמירה וחיפוש</button></div>
+    <div id="updMsg" class="upd-msg"></div>
+    <div id="updNew" hidden>
+      <div class="upd-new">גרסה <b id="updNewV"></b> מוכנה להתקנה</div>
+      <ul id="updNotes" class="upd-notes"></ul>
+      <div class="row2"><button class="primary" id="updGo">עדכון והפעלה מחדש</button></div>
+      <div class="upd-small">העבודה הפתוחה נשמרת וחוזרת אחרי העדכון. אם משהו לא בסדר: RESTORE-HEBREW-WHISPER.bat שבערכה מחזיר את הגרסה הקודמת.</div>
+    </div>
+  </div>
+</div></div>
+<div id="updating"><div><b>מעדכן…</b><br><span id="updatingT" style="color:var(--muted)">התוכנה תיסגר ותיפתח מחדש בעוד רגע</span></div></div>
 <div id="toast" role="status" aria-live="polite"></div>
 <div id="gone"><div>התוכנה נסגרה.<br><span style="color:var(--muted)">כדי להמשיך, הפעילו שוב את HEBREW-WHISPER.bat</span></div></div>
 <script src="/ui.js"></script>
